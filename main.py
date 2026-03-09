@@ -1,37 +1,52 @@
 import os
 import asyncio
+import logging
+import sys
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-
-from perplexity import AsyncPerplexity
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from openai import AsyncOpenAI
 
 load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 
-bot = Bot(token=TOKEN)
+# Проверка ключей
+if not TOKEN or not PERPLEXITY_API_KEY:
+    exit("Ошибка: Добавь TELEGRAM_TOKEN и PERPLEXITY_API_KEY в .env файл")
+
+# Инициализация бота (aiogram 3.x стиль) [web:34][web:40]
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
-# клиент, указываем base_url Perplexity [web:21][web:23]
+# Клиент Perplexity через OpenAI-совместимый интерфейс [web:21]
 px_client = AsyncOpenAI(
     api_key=PERPLEXITY_API_KEY,
-    base_url="https://api.perplexity.ai",
+    base_url="https://api.perplexity.ai"
 )
 
-chat_history: dict[int, list[str]] = {}
+# Хранилище (в памяти)
+chat_history = {}
 
 
 @dp.message(F.text, ~Command("summary"))
 async def collect_messages(message: types.Message):
     chat_id = message.chat.id
-    chat_history.setdefault(chat_id, [])
+    if chat_id not in chat_history:
+        chat_history[chat_id] = []
 
-    entry = f"{message.from_user.full_name}: {message.text}"
-    chat_history[chat_id].append(entry)
-    if len(chat_history[chat_id]) > 100:
+    user_name = message.from_user.full_name or "Аноним"
+    chat_history[chat_id].append(f"{user_name}: {message.text}")
+
+    # Храним только последние 50 сообщений для экономии токенов
+    if len(chat_history[chat_id]) > 50:
         chat_history[chat_id].pop(0)
 
 
@@ -41,34 +56,45 @@ async def summarize_chat(message: types.Message):
     history = chat_history.get(chat_id, [])
 
     if not history:
-        await message.answer("Пока нет сообщений для суммаризации.")
+        await message.answer("Слишком мало данных для анализа. Пообщайтесь еще немного!")
         return
 
     text_to_analyze = "\n".join(history)
 
-    prompt = (
-        "Ты делаешь краткое саммари Telegram‑переписки: темы, решения, next steps. "
-        "Максимум 10 пунктов.\n\n"
-        f"Сообщения:\n{text_to_analyze}"
-    )
+    processing_msg = await message.answer("🔄 Генерирую выжимку...")
 
     try:
-        completion = await px_client.chat.completions.create(
+        # Используем модель sonar-pro (актуальна на февраль 2026) [web:21]
+        response = await px_client.chat.completions.create(
             model="sonar-pro",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes group chats."},
-                {"role": "user", "content": prompt},
-            ],
+                {
+                    "role": "system",
+                    "content": "Ты профессиональный суммаризатор. Сделай краткую выжимку переписки на русском языке. Используй буллиты."
+                },
+                {
+                    "role": "user",
+                    "content": f"Проанализируй эти сообщения и выдели главное:\n\n{text_to_analyze}"
+                }
+            ]
         )
-        summary = completion.choices[0].message.content
-        await message.answer(f"<b>Саммари чата:</b>\n\n{summary}", parse_mode="HTML")
+
+        summary = response.choices[0].message.content
+        await processing_msg.edit_text(f"<b>📝 Итоги обсуждения:</b>\n\n{summary}")
+
     except Exception as e:
-        await message.answer(f"Ошибка Perplexity API: {e}")
+        logging.error(f"API Error: {e}")
+        await processing_msg.edit_text(f"❌ Ошибка при связи с ИИ. Проверь API-ключ.")
 
 
 async def main():
+    # Запуск логирования [web:34]
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот выключен")
